@@ -1,0 +1,27 @@
+services:
+  cursor-api-proxy:
+    build: .
+    user: "${RUN_AS_UID:-65532}:${RUN_AS_GID:-65532}"
+    ports:
+      - "127.0.0.1:${HOST_PORT:-8787}:8787"
+    environment:
+      LISTEN_ADDR: "0.0.0.0:8787"
+      CURSOR_API_KEY_FILE: /run/secrets/cursor_api_key
+      PROXY_API_KEY_FILE: /run/secrets/proxy_api_key
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-5m}
+      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-4}
+    secrets:
+      - cursor_api_key
+      - proxy_api_key
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 512m
+    restart: unless-stopped
+secrets:
+  cursor_api_key:
+    file: ./.secrets/cursor_api_key
+  proxy_api_key:
+    file: ./.secrets/proxy_api_key

@@ -1,0 +1,9 @@
+.git
+.github
+work
+bin
+.secrets
+.env
+.env.*
+*.log
+coverage.*

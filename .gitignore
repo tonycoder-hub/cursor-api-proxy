@@ -1,0 +1,10 @@
+/bin/
+/work/
+/.secrets/
+.env
+.env.*
+!.env.example
+*.log
+*.out
+coverage.*
+.DS_Store

@@ -1,0 +1,139 @@
+syntax = "proto3";
+package cursor.v1;
+
+option go_package = "github.com/tonycoder-hub/cursor-api-proxy/gen/cursorv1;cursorv1";
+
+// Minimal text-chat wire schema extracted from cliproxy-plugins.
+// Names, field types and field numbers are retained; see NOTICE.md.
+
+message AgentClientMessage {
+  .cursor.v1.AgentRunRequest run_request = 1;
+  .cursor.v1.ExecClientMessage exec_client_message = 2;
+  .cursor.v1.KvClientMessage kv_client_message = 3;
+}
+
+message AgentRunRequest {
+  .cursor.v1.ConversationStateStructure conversation_state = 1;
+  .cursor.v1.ConversationAction action = 2;
+  optional .cursor.v1.RequestedModel requested_model = 9;
+  .cursor.v1.McpTools mcp_tools = 4;
+  optional string conversation_id = 5;
+  optional string run_id = 25;
+}
+
+message ConversationStateStructure {
+}
+
+message ConversationAction {
+  .cursor.v1.UserMessageAction user_message_action = 1;
+}
+
+message UserMessageAction {
+  .cursor.v1.UserMessage user_message = 1;
+}
+
+message UserMessage {
+  string text = 1;
+}
+
+message RequestedModel {
+  string model_id = 1;
+}
+
+message McpTools {
+}
+
+message AgentServerMessage {
+  .cursor.v1.InteractionUpdate interaction_update = 1;
+  .cursor.v1.ExecServerMessage exec_server_message = 2;
+  .cursor.v1.KvServerMessage kv_server_message = 4;
+}
+
+message ExecServerMessage {
+  uint32 id = 1;
+  string exec_id = 15;
+  .cursor.v1.RequestContextArgs request_context_args = 10;
+}
+
+message ExecClientMessage {
+  uint32 id = 1;
+  string exec_id = 15;
+  .cursor.v1.RequestContextResult request_context_result = 10;
+}
+
+message RequestContextArgs {
+}
+
+message RequestContextResult {
+  .cursor.v1.RequestContextSuccess success = 1;
+}
+
+message RequestContextSuccess {
+  .cursor.v1.RequestContext request_context = 1;
+}
+
+message RequestContext {
+  .cursor.v1.RequestContextEnv env = 4;
+}
+
+message RequestContextEnv {
+  string os_version = 1;
+  repeated string workspace_paths = 2;
+  string shell = 3;
+  string time_zone = 10;
+  string project_folder = 11;
+}
+
+message KvServerMessage {
+  uint32 id = 1;
+  .cursor.v1.GetBlobArgs get_blob_args = 2;
+  .cursor.v1.SetBlobArgs set_blob_args = 3;
+}
+
+message KvClientMessage {
+  uint32 id = 1;
+  .cursor.v1.GetBlobResult get_blob_result = 2;
+  .cursor.v1.SetBlobResult set_blob_result = 3;
+}
+
+message SetBlobArgs {
+  bytes blob_id = 1;
+  bytes blob_data = 2;
+}
+
+message GetBlobArgs {
+  bytes blob_id = 1;
+}
+
+message SetBlobResult {
+  optional .cursor.v1.Error error = 1;
+}
+
+message GetBlobResult {
+  optional bytes blob_data = 1;
+  optional .cursor.v1.Error error = 2;
+}
+
+message Error {
+  string message = 1;
+}
+
+message InteractionUpdate {
+  .cursor.v1.TextDeltaUpdate text_delta = 1;
+  .cursor.v1.ThinkingDeltaUpdate thinking_delta = 4;
+  .cursor.v1.TurnEndedUpdate turn_ended = 14;
+}
+
+message TextDeltaUpdate {
+  string text = 1;
+}
+
+message ThinkingDeltaUpdate {
+  string text = 1;
+}
+
+message TurnEndedUpdate {
+  optional int64 input_tokens = 1;
+  optional int64 output_tokens = 2;
+  optional int64 cache_read_tokens = 3;
+}

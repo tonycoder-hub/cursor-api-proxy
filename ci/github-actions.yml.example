@@ -1,0 +1,19 @@
+name: Verify
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: [self-hosted, linux, x64, cursor-proxy]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify
+        run: |
+          make fmt-check
+          make test
+          make vet
+          make build

@@ -1,0 +1,2 @@
+* text=auto eol=lf
+gen/**/*.pb.go linguist-generated=true
