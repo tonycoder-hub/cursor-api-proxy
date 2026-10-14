@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -86,32 +85,16 @@ func (c *Client) invalidateToken(token string) {
 // The signature is not verified; exp is only a cache hint and a rejected token
 // is invalidated on 401/403 anyway.
 func tokenExpiry(token string, now time.Time) time.Time {
-	if exp, ok := jwtExpiry(token); ok {
-		return exp.Add(-tokenExpirySkew)
+	var claims struct {
+		Exp float64 `json:"exp"`
+	}
+	if parts := strings.Split(token, "."); len(parts) == 3 {
+		payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+		if err == nil && json.Unmarshal(payload, &claims) == nil && claims.Exp > 0 && claims.Exp < 1e11 {
+			return time.Unix(int64(claims.Exp), 0).Add(-tokenExpirySkew)
+		}
 	}
 	return now.Add(exchangeTTL)
-}
-
-func jwtExpiry(token string) (time.Time, bool) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return time.Time{}, false
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
-	if err != nil {
-		return time.Time{}, false
-	}
-	var claims struct {
-		Exp *float64 `json:"exp"`
-	}
-	if json.Unmarshal(payload, &claims) != nil || claims.Exp == nil {
-		return time.Time{}, false
-	}
-	exp := *claims.Exp
-	if math.IsNaN(exp) || exp <= 0 || exp >= 1e11 {
-		return time.Time{}, false
-	}
-	return time.Unix(int64(exp), 0), true
 }
 
 func (c *Client) exchangeToken(ctx context.Context) (string, error) {

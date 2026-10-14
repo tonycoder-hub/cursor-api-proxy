@@ -40,7 +40,7 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if len(c.ProxyAPIKey) < MinProxyAPIKeyBytes {
-		return c, fmt.Errorf("PROXY_API_KEY must be at least %d bytes; generate a random key, e.g. with: openssl rand -hex 32", MinProxyAPIKeyBytes)
+		return c, fmt.Errorf("PROXY_API_KEY is %d bytes but must be at least %d bytes; generate a new key with `openssl rand -hex 32`, set it in PROXY_API_KEY or PROXY_API_KEY_FILE, and give it to the clients", len(c.ProxyAPIKey), MinProxyAPIKeyBytes)
 	}
 	if c.CursorAPIKey == c.ProxyAPIKey {
 		return c, fmt.Errorf("PROXY_API_KEY must differ from CURSOR_API_KEY")

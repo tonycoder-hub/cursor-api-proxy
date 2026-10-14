@@ -32,7 +32,7 @@ type Server struct {
 	timeout   time.Duration
 	slots     chan struct{}
 	logger    *slog.Logger
-	secrets   []string // upstream credentials redacted from logs
+	secret    string // upstream API key, redacted from logs
 	keepAlive time.Duration
 }
 
@@ -44,8 +44,8 @@ func New(backend Backend, apiKey string, timeout time.Duration, maxConcurrent in
 		return nil, fmt.Errorf("invalid proxy configuration")
 	}
 	s := &Server{backend: backend, keyHash: sha256.Sum256([]byte(apiKey)), timeout: timeout, slots: make(chan struct{}, maxConcurrent), logger: slog.Default(), keepAlive: keepAliveInterval}
-	if holder, ok := backend.(credentialHolder); ok {
-		s.secrets = holder.credentials()
+	if cursorBackend, ok := backend.(*CursorBackend); ok {
+		s.secret = cursorBackend.client.APIKey
 	}
 	return s, nil
 }
@@ -265,20 +265,19 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 		err = errIncompleteStream
 	}
 	if err != nil {
-		committed := stopKeepAlive()
-		switch {
-		case started:
-			s.logFailure(r, requestID, request.Model, http.StatusOK, true, err)
-			_ = send(errorValue("upstream_error", "upstream_error", "Cursor upstream stream failed; the completion is incomplete (request ID "+requestID+")"))
-		case committed:
-			// Keep-alive comments already sent a 200 SSE response, so the
-			// failure can only be reported as an error event.
-			_, code := upstreamStatus(r)
-			s.logFailure(r, requestID, request.Model, http.StatusOK, false, err)
-			_ = send(errorValue("upstream_error", code, upstreamMessage(requestID)))
-		default:
+		if committed := stopKeepAlive(); !started && !committed {
 			s.upstreamError(w, r, requestID, request.Model, err)
+			return
 		}
+		// Content or keep-alive comments already sent a 200 SSE response, so
+		// the failure can only be reported as an error event.
+		_, code := upstreamStatus(r)
+		message := upstreamMessage(requestID)
+		if started {
+			message = "Cursor upstream stream failed; the completion is incomplete (request ID " + requestID + ")"
+		}
+		s.logFailure(r, requestID, request.Model, http.StatusOK, started, err)
+		_ = send(errorValue("upstream_error", code, message))
 		return
 	}
 	if err := start(); err != nil {
@@ -307,9 +306,6 @@ func setStreamHeaders(w http.ResponseWriter) {
 // function is called or ctx ends. stop is idempotent, waits for any write in
 // progress, and reports whether a keep-alive committed the SSE response.
 func startKeepAlive(ctx context.Context, w http.ResponseWriter, controller *http.ResponseController, interval time.Duration) func() bool {
-	if interval <= 0 {
-		return func() bool { return false }
-	}
 	quit, done := make(chan struct{}), make(chan struct{})
 	committed := false
 	go func() {

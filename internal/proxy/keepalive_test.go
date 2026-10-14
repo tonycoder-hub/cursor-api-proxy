@@ -5,7 +5,6 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -19,16 +18,7 @@ import (
 func openKeepAliveStream(t *testing.T, server *Server) (*http.Response, *bufio.Reader) {
 	t.Helper()
 	server.keepAlive = 5 * time.Millisecond
-	upstream := httptest.NewServer(server)
-	t.Cleanup(upstream.Close)
-	request, _ := http.NewRequest("POST", upstream.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
-	request.Header.Set("Authorization", "Bearer fixture-proxy-key")
-	request.Header.Set("Content-Type", "application/json")
-	response, err := upstream.Client().Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { response.Body.Close() })
+	response := openStream(t, context.Background(), server)
 	if response.StatusCode != 200 || response.Header.Get("Content-Type") != "text/event-stream" {
 		t.Fatalf("status=%d content-type=%q", response.StatusCode, response.Header.Get("Content-Type"))
 	}
@@ -102,18 +92,6 @@ func TestStreamFailureAfterKeepAliveIsAnErrorEvent(t *testing.T) {
 	records := logRecords(t, logs)
 	if len(records) != 1 || records[0]["request_id"] != requestID || records[0]["status"] != float64(200) || records[0]["partial"] != nil || records[0]["upstream_status"] != float64(500) {
 		t.Fatalf("unexpected log records: %s", logs)
-	}
-}
-
-func TestStreamFailureBeforeKeepAliveKeepsHTTPStatus(t *testing.T) {
-	backend := &stubBackend{run: func(context.Context, func(cursor.TextChunk) error) error {
-		return &cursor.StatusError{Op: "RunSSE", Status: 500}
-	}}
-	server, _ := New(backend, "fixture-proxy-key", 5*time.Second, 1)
-	captureLogs(server)
-	out := call(t, server, "POST", "/v1/chat/completions", "fixture-proxy-key", `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}`)
-	if out.Code != 502 || strings.Contains(out.Body.String(), "keep-alive") {
-		t.Fatalf("status=%d body=%q", out.Code, out.Body)
 	}
 }
 

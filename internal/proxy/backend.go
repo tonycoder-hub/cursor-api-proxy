@@ -130,11 +130,6 @@ func (b *CursorBackend) fetchModels(ctx context.Context) ([]Model, error) {
 	return models, nil
 }
 
-// credentials lists the upstream secrets that must be redacted from logs.
-func (b *CursorBackend) credentials() []string {
-	return []string{b.client.APIKey}
-}
-
 func (b *CursorBackend) Run(ctx context.Context, model, prompt string, callback func(cursor.TextChunk) error) error {
 	return b.client.Run(ctx, model, prompt, cursor.IDs{ConversationID: "agent-" + newUUID(), RunID: newUUID()}, callback)
 }

@@ -51,7 +51,7 @@ func TestProxyKeyMinimumLength(t *testing.T) {
 	setValidEnv(t)
 	short := strings.Repeat("k", MinProxyAPIKeyBytes-1)
 	t.Setenv("PROXY_API_KEY", short)
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") || strings.Contains(err.Error(), short) {
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "is 31 bytes but must be at least 32 bytes; generate a new key with `openssl rand -hex 32`") || strings.Contains(err.Error(), short) {
 		t.Fatalf("short proxy key: %v", err)
 	}
 	t.Setenv("PROXY_API_KEY", "")

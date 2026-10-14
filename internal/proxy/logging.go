@@ -12,12 +12,6 @@ import (
 	"github.com/tonycoder-hub/cursor-api-proxy/internal/cursor"
 )
 
-// credentialHolder is implemented by backends that hold upstream credentials.
-// Their values are redacted from every logged error message.
-type credentialHolder interface {
-	credentials() []string
-}
-
 const maxLoggedErrorBytes = 512
 
 var (
@@ -40,10 +34,8 @@ func (s *Server) sanitizeError(cause error) string {
 		return ""
 	}
 	message := cause.Error()
-	for _, secret := range s.secrets {
-		if secret != "" {
-			message = strings.ReplaceAll(message, secret, "[REDACTED]")
-		}
+	if s.secret != "" {
+		message = strings.ReplaceAll(message, s.secret, "[REDACTED]")
 	}
 	message = authSchemePattern.ReplaceAllString(message, "$1 [REDACTED]")
 	message = jwtPattern.ReplaceAllString(message, "[REDACTED]")

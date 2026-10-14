@@ -49,7 +49,7 @@ func TestUpstreamFailureIsLoggedWithRequestID(t *testing.T) {
 		return fmt.Errorf("%s: %w", leakyCause, &cursor.StatusError{Op: "RunSSE", Status: 401})
 	}}
 	server, _ := New(backend, "fixture-proxy-key", time.Second, 1)
-	server.secrets = []string{"fixture-cursor-key"}
+	server.secret = "fixture-cursor-key"
 	logs := captureLogs(server)
 	out := call(t, server, "POST", "/v1/chat/completions", "fixture-proxy-key", `{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`)
 	if out.Code != 502 {
@@ -108,7 +108,7 @@ func TestStreamFailureAfterOutputIsLoggedAsPartial(t *testing.T) {
 }
 
 func TestModelDiscoveryFailureIsLogged(t *testing.T) {
-	backend := &failingModels{err: &cursor.StatusError{Op: "model discovery", Status: 403}}
+	backend := &stubBackend{modelsErr: &cursor.StatusError{Op: "model discovery", Status: 403}}
 	server, _ := New(backend, "fixture-proxy-key", time.Second, 1)
 	logs := captureLogs(server)
 	out := call(t, server, "GET", "/v1/models", "fixture-proxy-key", "")
@@ -116,13 +116,6 @@ func TestModelDiscoveryFailureIsLogged(t *testing.T) {
 	if out.Code != 502 || len(records) != 1 || records[0]["request_id"] != out.Header().Get("X-Request-Id") || records[0]["upstream_status"] != float64(403) {
 		t.Fatalf("status=%d logs=%s", out.Code, logs)
 	}
-}
-
-type failingModels struct{ err error }
-
-func (b *failingModels) Models(context.Context) ([]Model, error) { return nil, b.err }
-func (b *failingModels) Run(context.Context, string, string, func(cursor.TextChunk) error) error {
-	return b.err
 }
 
 func TestSanitizeErrorRedactsCredentials(t *testing.T) {

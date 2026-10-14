@@ -51,6 +51,22 @@ func call(t *testing.T, handler http.Handler, method, path, key, body string) *h
 	return out
 }
 
+// openStream sends a streaming chat request to handler through a real server.
+func openStream(t *testing.T, ctx context.Context, handler http.Handler) *http.Response {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	req, _ := http.NewRequestWithContext(ctx, "POST", server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	req.Header.Set("Authorization", "Bearer fixture-proxy-key")
+	req.Header.Set("Content-Type", "application/json")
+	response, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { response.Body.Close() })
+	return response
+}
+
 func TestHTTPToCursorWireProtocol(t *testing.T) {
 	var models, exchanges, contextReplies, blobReplies atomic.Int32
 	var prompt atomic.Value
@@ -232,11 +248,15 @@ func TestDefaultClientVersion(t *testing.T) {
 
 type stubBackend struct {
 	run        func(context.Context, func(cursor.TextChunk) error) error
+	modelsErr  error
 	modelCalls atomic.Int32
 }
 
 func (b *stubBackend) Models(context.Context) ([]Model, error) {
 	b.modelCalls.Add(1)
+	if b.modelsErr != nil {
+		return nil, b.modelsErr
+	}
 	return []Model{{ID: "test-model"}}, nil
 }
 func (b *stubBackend) Run(ctx context.Context, _ string, _ string, fn func(cursor.TextChunk) error) error {
@@ -369,18 +389,9 @@ func TestCancellationAndConcurrencyLimit(t *testing.T) {
 		return ctx.Err()
 	}}
 	handler, _ := New(backend, "fixture-proxy-key", time.Second, 1)
-	server := httptest.NewServer(handler)
-	defer server.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "POST", server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
-	req.Header.Set("Authorization", "Bearer fixture-proxy-key")
-	req.Header.Set("Content-Type", "application/json")
-	response, err := server.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
+	openStream(t, ctx, handler)
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
@@ -426,23 +437,27 @@ func TestEmptyCatalogFails(t *testing.T) {
 }
 
 func TestTimeoutAndMissingTurnEnded(t *testing.T) {
-	for _, mode := range []string{"timeout", "missing-turn"} {
-		t.Run(mode, func(t *testing.T) {
+	for _, tc := range []struct {
+		mode, stream string
+		status       int
+		code         string
+	}{
+		{"timeout", "false", 504, "upstream_timeout"},
+		{"missing-turn", "false", 502, "upstream_error"},
+		{"stream-timeout-after-output", "true", 200, "upstream_timeout"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
 			backend := &stubBackend{run: func(ctx context.Context, fn func(cursor.TextChunk) error) error {
-				if mode == "timeout" {
-					<-ctx.Done()
-					return ctx.Err()
+				if err := fn(cursor.TextChunk{Text: "partial"}); err != nil || tc.mode == "missing-turn" {
+					return err
 				}
-				return fn(cursor.TextChunk{Text: "partial"})
+				<-ctx.Done()
+				return ctx.Err()
 			}}
 			handler, _ := New(backend, "fixture-proxy-key", 20*time.Millisecond, 1)
-			out := call(t, handler, "POST", "/v1/chat/completions", "fixture-proxy-key", `{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`)
-			want := 502
-			if mode == "timeout" {
-				want = 504
-			}
-			if out.Code != want {
-				t.Fatalf("status=%d want=%d", out.Code, want)
+			out := call(t, handler, "POST", "/v1/chat/completions", "fixture-proxy-key", `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":`+tc.stream+`}`)
+			if out.Code != tc.status || !strings.Contains(out.Body.String(), `"code":"`+tc.code+`"`) {
+				t.Fatalf("status=%d body=%s", out.Code, out.Body)
 			}
 			if bytes.Contains(out.Body.Bytes(), []byte(`"finish_reason":"stop"`)) {
 				t.Fatal("incomplete result succeeded")

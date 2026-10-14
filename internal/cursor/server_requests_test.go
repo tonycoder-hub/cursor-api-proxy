@@ -106,6 +106,7 @@ func TestUnsupportedServerRequestsFailTheStream(t *testing.T) {
 	}{
 		{"exec", &cursorv1.AgentServerMessage{ExecServerMessage: &cursorv1.ExecServerMessage{Id: 5, ExecId: "fixture-exec"}}, "Cursor requested unsupported tool execution"},
 		{"kv", &cursorv1.AgentServerMessage{KvServerMessage: &cursorv1.KvServerMessage{Id: 6}}, "Cursor sent an unsupported blob store request"},
+		{"interaction query", unknownMessage(interactionQueryField), "Cursor sent an unsupported interaction query"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := runRequests(t, tc.request)
@@ -114,4 +115,25 @@ func TestUnsupportedServerRequestsFailTheStream(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Other unknown top-level messages carry no request marker and are ignored; if
+// one was a request, the request timeout bounds the wait for the reply.
+func TestUnknownServerMessageWaitsOnlyUntilTimeout(t *testing.T) {
+	client := requestFixture(t, []*cursorv1.AgentServerMessage{unknownMessage(9)})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := client.Run(ctx, "test-model", "hi", IDs{RunID: "test-run"}, func(TextChunk) error { return nil })
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+// unknownMessage is a server message with only top-level field num, which the
+// reduced schema does not define.
+func unknownMessage(num protowire.Number) *cursorv1.AgentServerMessage {
+	message := &cursorv1.AgentServerMessage{}
+	field := protowire.AppendTag(nil, num, protowire.BytesType)
+	message.ProtoReflect().SetUnknown(protowire.AppendBytes(field, []byte{0x08, 0x01})) // {id: 1}
+	return message
 }
