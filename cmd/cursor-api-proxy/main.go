@@ -53,7 +53,7 @@ func run() error {
 	}
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
-		return fmt.Errorf("cannot listen on configured LISTEN_ADDR")
+		return fmt.Errorf("cannot listen on configured LISTEN_ADDR: %w", err)
 	}
 	log.Printf("cursor-api-proxy %s listening on %s", version, listener.Addr())
 	serveErr := make(chan error, 1)
@@ -63,13 +63,13 @@ func run() error {
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
-		return fmt.Errorf("HTTP server stopped unexpectedly")
+		return fmt.Errorf("HTTP server stopped unexpectedly: %w", err)
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			_ = server.Close()
-			return fmt.Errorf("HTTP shutdown timed out")
+			return fmt.Errorf("HTTP shutdown did not complete: %w", err)
 		}
 		return nil
 	}

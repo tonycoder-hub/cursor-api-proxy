@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,6 +27,9 @@ const (
 	procRunSSE     = "/agent.v1.AgentService/RunSSE"
 
 	clientType = "sdk"
+
+	// DefaultClientVersion is the x-cursor-client-version sent unless overridden.
+	DefaultClientVersion = "cli-2025.08.01"
 )
 
 // Client speaks Cursor's agent wire protocol directly.
@@ -58,7 +62,7 @@ func NewClient(apiKey string) *Client {
 		HTTP:          http.DefaultClient,
 		RPCBase:       defaultRPCBase,
 		APIKey:        apiKey,
-		ClientVersion: "cli-2025.08.01",
+		ClientVersion: DefaultClientVersion,
 		GhostMode:     true,
 	}
 }
@@ -84,19 +88,40 @@ func (c *Client) commonHeaders(h http.Header, bearer string) {
 }
 
 // bidiAppend performs one BidiService/BidiAppend unary call for a client message.
+// An append rejected with 401/403 was not applied, so it is resent once with a
+// freshly exchanged token.
 func (c *Client) bidiAppend(ctx context.Context, msg *cursorv1.AgentClientMessage, convID string, seq uint64) error {
 	body, err := BuildBidiAppendBody(msg, convID, seq)
 	if err != nil {
 		return err
 	}
-	token, err := c.accessToken(ctx)
-	if err != nil {
-		return err
+	for attempt := 0; ; attempt++ {
+		token, err := c.accessToken(ctx)
+		if err != nil {
+			return err
+		}
+		status, err := c.postBidiAppend(ctx, body, token)
+		if err != nil {
+			return err
+		}
+		if status == http.StatusOK {
+			return nil
+		}
+		if authRejected(status) {
+			c.invalidateToken(token)
+			if attempt == 0 {
+				continue
+			}
+		}
+		return &StatusError{Op: "BidiAppend", Status: status}
 	}
+}
+
+func (c *Client) postBidiAppend(ctx context.Context, body []byte, token string) (int, error) {
 	// BidiAppend is a UNARY Connect call: raw protobuf body, no 5-byte frame prefix.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+procBidiAppend, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	c.commonHeaders(req.Header, token)
 	req.Header.Set("Content-Type", "application/proto")
@@ -104,14 +129,11 @@ func (c *Client) bidiAppend(ctx context.Context, msg *cursorv1.AgentClientMessag
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("BidiAppend: %w", err)
+		return 0, fmt.Errorf("BidiAppend: %w", err)
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("BidiAppend status %d", resp.StatusCode)
-	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 // TextChunk is a decoded piece of the model's output stream.
@@ -160,29 +182,11 @@ func (c *Client) Run(ctx context.Context, model, userText string, ids IDs, onChu
 // runSSE opens the RunSSE server stream and dispatches decoded chunks, replying to
 // the server's context request via additional BidiAppend calls.
 func (c *Client) runSSE(ctx context.Context, ids IDs, onChunk func(TextChunk) error) error {
-	token, err := c.accessToken(ctx)
+	resp, token, err := c.openRunSSE(ctx, ids.RunID)
 	if err != nil {
 		return err
-	}
-	body := encodeFrame(BuildRunSSEBody(ids.RunID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+procRunSSE, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	c.commonHeaders(req.Header, token)
-	req.Header.Set("Content-Type", "application/connect+proto")
-	req.Header.Set("connect-protocol-version", "1")
-	req.Header.Set("x-cursor-streaming", "true")
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return fmt.Errorf("RunSSE: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("RunSSE status %d: upstream request failed", resp.StatusCode)
-	}
 
 	// seq counter shared by the follow-up BidiAppend calls (context reply, acks).
 	var seq atomic.Uint64
@@ -196,7 +200,6 @@ func (c *Client) runSSE(ctx context.Context, ids IDs, onChunk func(TextChunk) er
 	}
 
 	r := bufio.NewReader(resp.Body)
-	contextSent := false
 	blobBytes := 0
 	blobs := map[string][]byte{} // remote blob store the server reads/writes mid-turn
 	for {
@@ -208,7 +211,14 @@ func (c *Client) runSSE(ctx context.Context, ids IDs, onChunk func(TextChunk) er
 			return err
 		}
 		if frame.EndStream() {
-			return parseRunSSETrailer(frame.Payload)
+			err := parseRunSSETrailer(frame.Payload)
+			// The stream was consumed, so it is not retried; the next request
+			// exchanges a fresh token instead of reusing the rejected one.
+			var trailerErr *TrailerError
+			if errors.As(err, &trailerErr) && trailerErr.Code == "unauthenticated" {
+				c.invalidateToken(token)
+			}
+			return err
 		}
 
 		var sm cursorv1.AgentServerMessage
@@ -216,21 +226,18 @@ func (c *Client) runSSE(ctx context.Context, ids IDs, onChunk func(TextChunk) er
 			return fmt.Errorf("decode RunSSE message failed")
 		}
 
-		// Answer the mid-turn context request exactly once.
-		if !contextSent {
-			if esm := sm.GetExecServerMessage(); esm != nil && esm.GetRequestContextArgs() != nil {
-				reply := c.contextReply()
-				reply.ExecClientMessage.Id = esm.GetId()
-				reply.ExecClientMessage.ExecId = esm.GetExecId()
-				if err := sendClient(reply); err != nil {
-					return fmt.Errorf("context reply: %w", err)
-				}
-				contextSent = true
+		// Every server request needs a reply: an unanswered one stalls the turn
+		// until the request timeout, so unsupported requests fail the stream.
+		if esm := sm.GetExecServerMessage(); esm != nil {
+			if esm.GetRequestContextArgs() == nil {
+				return fmt.Errorf("Cursor requested unsupported tool execution")
 			}
-		}
-
-		if esm := sm.GetExecServerMessage(); esm != nil && esm.GetRequestContextArgs() == nil {
-			return fmt.Errorf("Cursor requested unsupported tool execution")
+			reply := c.contextReply()
+			reply.ExecClientMessage.Id = esm.GetId()
+			reply.ExecClientMessage.ExecId = esm.GetExecId()
+			if err := sendClient(reply); err != nil {
+				return fmt.Errorf("context reply: %w", err)
+			}
 		}
 
 		// Answer blob store requests so the server can finalize the turn.
@@ -255,17 +262,54 @@ func (c *Client) runSSE(ctx context.Context, ids IDs, onChunk func(TextChunk) er
 				} else {
 					reply.GetBlobResult = &cursorv1.GetBlobResult{Error: &cursorv1.Error{Message: "blob not found"}}
 				}
+			} else {
+				return fmt.Errorf("Cursor sent an unsupported blob store request")
 			}
-			if reply.SetBlobResult != nil || reply.GetBlobResult != nil {
-				if err := sendClient(&cursorv1.AgentClientMessage{KvClientMessage: reply}); err != nil {
-					return fmt.Errorf("kv reply: %w", err)
-				}
+			if err := sendClient(&cursorv1.AgentClientMessage{KvClientMessage: reply}); err != nil {
+				return fmt.Errorf("kv reply: %w", err)
 			}
 		}
 
 		if err := emitChunks(&sm, onChunk); err != nil {
 			return err
 		}
+	}
+}
+
+// openRunSSE opens the RunSSE stream. A 401/403 is returned before any frame is
+// read, so the open is retried once with a freshly exchanged token.
+func (c *Client) openRunSSE(ctx context.Context, runID string) (*http.Response, string, error) {
+	body := encodeFrame(BuildRunSSEBody(runID))
+	for attempt := 0; ; attempt++ {
+		token, err := c.accessToken(ctx)
+		if err != nil {
+			return nil, "", err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+procRunSSE, bytes.NewReader(body))
+		if err != nil {
+			return nil, "", err
+		}
+		c.commonHeaders(req.Header, token)
+		req.Header.Set("Content-Type", "application/connect+proto")
+		req.Header.Set("connect-protocol-version", "1")
+		req.Header.Set("x-cursor-streaming", "true")
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return nil, "", fmt.Errorf("RunSSE: %w", err)
+		}
+		if resp.StatusCode == http.StatusOK {
+			return resp, token, nil
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		if authRejected(resp.StatusCode) {
+			c.invalidateToken(token)
+			if attempt == 0 {
+				continue
+			}
+		}
+		return nil, "", &StatusError{Op: "RunSSE", Status: resp.StatusCode}
 	}
 }
 
@@ -312,10 +356,7 @@ func parseRunSSETrailer(payload []byte) error {
 			break
 		}
 	}
-	if modelUnavailable {
-		return fmt.Errorf("Cursor RunSSE %s: model is not available for this account or region", code)
-	}
-	return fmt.Errorf("Cursor RunSSE %s: upstream request failed", code)
+	return &TrailerError{Code: code, ModelUnavailable: modelUnavailable}
 }
 
 func safeConnectCode(value string) string {

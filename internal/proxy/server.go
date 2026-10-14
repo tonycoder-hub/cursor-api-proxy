@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tonycoder-hub/cursor-api-proxy/internal/cursor"
@@ -20,18 +22,32 @@ import (
 const maxBodyBytes = 1 << 20
 const maxOutputBytes = 8 << 20
 
+// keepAliveInterval is how often a stream that has not produced its first
+// chunk yet sends an SSE comment, so idle-timeout proxies keep it open.
+const keepAliveInterval = 15 * time.Second
+
 type Server struct {
-	backend Backend
-	keyHash [32]byte
-	timeout time.Duration
-	slots   chan struct{}
+	backend   Backend
+	keyHash   [32]byte
+	timeout   time.Duration
+	slots     chan struct{}
+	logger    *slog.Logger
+	secrets   []string // upstream credentials redacted from logs
+	keepAlive time.Duration
 }
+
+// errIncompleteStream reports an upstream stream that ended without turn-ended.
+var errIncompleteStream = errors.New("Cursor stream ended without a turn-ended update")
 
 func New(backend Backend, apiKey string, timeout time.Duration, maxConcurrent int) (*Server, error) {
 	if backend == nil || apiKey == "" || timeout <= 0 || maxConcurrent < 1 {
 		return nil, fmt.Errorf("invalid proxy configuration")
 	}
-	return &Server{backend: backend, keyHash: sha256.Sum256([]byte(apiKey)), timeout: timeout, slots: make(chan struct{}, maxConcurrent)}, nil
+	s := &Server{backend: backend, keyHash: sha256.Sum256([]byte(apiKey)), timeout: timeout, slots: make(chan struct{}, maxConcurrent), logger: slog.Default(), keepAlive: keepAliveInterval}
+	if holder, ok := backend.(credentialHolder); ok {
+		s.secrets = holder.credentials()
+	}
+	return s, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -41,10 +57,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
-	authorization := r.Header.Get("Authorization")
-	supplied := strings.TrimPrefix(authorization, "Bearer ")
+	requestID := newRequestID()
+	w.Header().Set("X-Request-Id", requestID)
+	supplied, ok := bearerToken(r.Header.Get("Authorization"))
 	candidate := sha256.Sum256([]byte(supplied))
-	if !strings.HasPrefix(authorization, "Bearer ") || subtle.ConstantTimeCompare(candidate[:], s.keyHash[:]) != 1 {
+	if !ok || subtle.ConstantTimeCompare(candidate[:], s.keyHash[:]) != 1 {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "A valid proxy Bearer token is required")
 		return
@@ -55,6 +72,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			methodError(w, "GET")
 			return
 		}
+		// The catalog is cached and its refresh is de-duplicated, so listing
+		// models does not take one of the chat concurrency slots.
+		ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
+		defer cancel()
+		models, err := s.backend.Models(ctx)
+		if err != nil {
+			s.upstreamError(w, r.WithContext(ctx), requestID, "", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
+		return
 	case "/v1/chat/completions":
 		if r.Method != http.MethodPost {
 			methodError(w, "POST")
@@ -74,19 +102,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
 	defer cancel()
-	if r.URL.Path == "/v1/models" {
-		models, err := s.backend.Models(ctx)
-		if err != nil {
-			upstreamError(w, ctx)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
-		return
-	}
-	s.chat(w, r.WithContext(ctx))
+	s.chat(w, r.WithContext(ctx), requestID)
 }
 
-func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
+// bearerToken returns the credential of a Bearer Authorization header. The
+// scheme is case-insensitive and may be followed by several spaces (RFC 7235).
+func bearerToken(header string) (string, bool) {
+	scheme, token, ok := strings.Cut(header, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	token = strings.TrimLeft(token, " ")
+	return token, token != ""
+}
+
+func (s *Server) chat(w http.ResponseWriter, r *http.Request, requestID string) {
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
 		writeError(w, http.StatusUnsupportedMediaType, "invalid_request_error", "content_type", "Content-Type must be application/json")
@@ -103,6 +133,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "body_too_large", "Request exceeds 1 MiB")
 			return
 		}
+		if field, ok := strings.CutPrefix(err.Error(), "json: unknown field "); ok && len(field) <= 66 {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "unsupported_field", "Unsupported request field "+field+"; see the supported request fields in README")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_json", "Invalid request JSON or unsupported field; see the supported request fields in README")
 		return
 	}
@@ -117,7 +151,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	catalog, err := s.backend.Models(r.Context())
 	if err != nil {
-		upstreamError(w, r.Context())
+		s.upstreamError(w, r, requestID, "", err)
 		return
 	}
 	known := false
@@ -132,7 +166,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if request.Stream {
-		s.stream(w, r, request, prompt)
+		s.stream(w, r, requestID, request, prompt)
 		return
 	}
 	var text, thinking strings.Builder
@@ -150,8 +184,11 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	})
-	if err != nil || !usage.Done {
-		upstreamError(w, r.Context())
+	if err == nil && !usage.Done {
+		err = errIncompleteStream
+	}
+	if err != nil {
+		s.upstreamError(w, r, requestID, request.Model, err)
 		return
 	}
 	message := map[string]any{"role": "assistant", "content": text.String()}
@@ -164,7 +201,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) stream(w http.ResponseWriter, r *http.Request, request chatRequest, prompt string) {
+func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string, request chatRequest, prompt string) {
 	id, created := "chatcmpl-"+newUUID(), time.Now().Unix()
 	started := false
 	controller := http.NewResponseController(w)
@@ -188,13 +225,17 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, request chatRequ
 		}
 		return value
 	}
+	// Until the first chunk, keep-alive comments are the only writer; start
+	// stops them before writing data so writes never overlap.
+	stopKeepAlive := startKeepAlive(r.Context(), w, controller, s.keepAlive)
+	defer stopKeepAlive()
 	start := func() error {
 		if started {
 			return nil
 		}
+		stopKeepAlive()
 		started = true
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("X-Accel-Buffering", "no")
+		setStreamHeaders(w)
 		return send(chunk(map[string]string{"role": "assistant", "content": ""}, nil))
 	}
 	err := s.backend.Run(r.Context(), request.Model, prompt, func(value cursor.TextChunk) error {
@@ -220,12 +261,24 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, request chatRequ
 		}
 		return send(chunk(delta, nil))
 	})
-	if err != nil || !usage.Done {
-		if !started {
-			upstreamError(w, r.Context())
-			return
+	if err == nil && !usage.Done {
+		err = errIncompleteStream
+	}
+	if err != nil {
+		committed := stopKeepAlive()
+		switch {
+		case started:
+			s.logFailure(r, requestID, request.Model, http.StatusOK, true, err)
+			_ = send(errorValue("upstream_error", "upstream_error", "Cursor upstream stream failed; the completion is incomplete (request ID "+requestID+")"))
+		case committed:
+			// Keep-alive comments already sent a 200 SSE response, so the
+			// failure can only be reported as an error event.
+			_, code := upstreamStatus(r)
+			s.logFailure(r, requestID, request.Model, http.StatusOK, false, err)
+			_ = send(errorValue("upstream_error", code, upstreamMessage(requestID)))
+		default:
+			s.upstreamError(w, r, requestID, request.Model, err)
 		}
-		_ = send(errorValue("upstream_error", "upstream_error", "Cursor upstream stream failed; the completion is incomplete"))
 		return
 	}
 	if err := start(); err != nil {
@@ -245,6 +298,53 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, request chatRequ
 	}
 }
 
+func setStreamHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("X-Accel-Buffering", "no")
+}
+
+// startKeepAlive writes an SSE comment every interval until the returned stop
+// function is called or ctx ends. stop is idempotent, waits for any write in
+// progress, and reports whether a keep-alive committed the SSE response.
+func startKeepAlive(ctx context.Context, w http.ResponseWriter, controller *http.ResponseController, interval time.Duration) func() bool {
+	if interval <= 0 {
+		return func() bool { return false }
+	}
+	quit, done := make(chan struct{}), make(chan struct{})
+	committed := false
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-quit:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			if !committed {
+				committed = true
+				setStreamHeaders(w)
+			}
+			_ = controller.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := io.WriteString(w, ": keep-alive\n\n"); err != nil || controller.Flush() != nil {
+				return
+			}
+		}
+	}()
+	var once sync.Once
+	return func() bool {
+		once.Do(func() { close(quit) })
+		<-done
+		return committed
+	}
+}
+
 func usageValue(usage cursor.TextChunk) map[string]any {
 	return map[string]any{"prompt_tokens": usage.PromptTokens, "completion_tokens": usage.CompletionTokens, "total_tokens": usage.PromptTokens + usage.CompletionTokens, "prompt_tokens_details": map[string]int64{"cached_tokens": usage.CachedTokens}}
 }
@@ -254,12 +354,23 @@ func methodError(w http.ResponseWriter, allow string) {
 	writeError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed", "Method not allowed")
 }
 
-func upstreamError(w http.ResponseWriter, ctx context.Context) {
-	status, code := http.StatusBadGateway, "upstream_error"
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		status, code = http.StatusGatewayTimeout, "upstream_timeout"
+// upstreamError logs the sanitized cause and sends a client error that carries
+// only the request ID for correlation, never upstream details.
+func (s *Server) upstreamError(w http.ResponseWriter, r *http.Request, requestID, model string, cause error) {
+	status, code := upstreamStatus(r)
+	s.logFailure(r, requestID, model, status, false, cause)
+	writeError(w, status, "upstream_error", code, upstreamMessage(requestID))
+}
+
+func upstreamStatus(r *http.Request) (int, string) {
+	if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout, "upstream_timeout"
 	}
-	writeError(w, status, "upstream_error", code, "Cursor upstream request failed; verify account access and model availability")
+	return http.StatusBadGateway, "upstream_error"
+}
+
+func upstreamMessage(requestID string) string {
+	return "Cursor upstream request failed; verify account access and model availability (request ID " + requestID + ")"
 }
 
 func errorValue(kind, code, message string) map[string]any {

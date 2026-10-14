@@ -75,6 +75,9 @@ func TestHTTPToCursorWireProtocol(t *testing.T) {
 			if r.Header.Get("Content-Type") != "application/proto" {
 				t.Error("invalid BidiAppend content type")
 			}
+			if r.Header.Get("x-cursor-client-version") != "cli-fixture.1" {
+				t.Error("configured client version was not sent")
+			}
 			body, _ := io.ReadAll(r.Body)
 			num, kind, n := protowire.ConsumeTag(body)
 			if n < 0 || num != 1 || kind != protowire.BytesType {
@@ -148,7 +151,7 @@ func TestHTTPToCursorWireProtocol(t *testing.T) {
 		}
 	}))
 	defer upstream.Close()
-	backend := NewCursorBackend(config.Config{CursorAPIKey: "fixture-cursor-key", RPCBaseURL: upstream.URL, ModelsURL: upstream.URL + "/v1/models", MaxConcurrent: 4})
+	backend := NewCursorBackend(config.Config{CursorAPIKey: "fixture-cursor-key", RPCBaseURL: upstream.URL, ModelsURL: upstream.URL + "/v1/models", MaxConcurrent: 4, ClientVersion: "cli-fixture.1"})
 	server, err := New(backend, "fixture-proxy-key", time.Second, 4)
 	if err != nil {
 		t.Fatal(err)
@@ -193,6 +196,40 @@ func TestHTTPToCursorWireProtocol(t *testing.T) {
 	}
 }
 
+func TestBearerSchemeIsCaseInsensitive(t *testing.T) {
+	server, _ := New(&stubBackend{}, "fixture-proxy-key", time.Second, 1)
+	for header, status := range map[string]int{
+		"Bearer fixture-proxy-key":  200,
+		"bearer fixture-proxy-key":  200,
+		"BEARER fixture-proxy-key":  200,
+		"Bearer  fixture-proxy-key": 200,
+		"Basic fixture-proxy-key":   401,
+		"Bearerfixture-proxy-key":   401,
+		"Bearer fixture-proxy-ke":   401,
+		"Bearer ":                   401,
+		"Bearer":                    401,
+		"fixture-proxy-key":         401,
+		"":                          401,
+	} {
+		req := httptest.NewRequest("GET", "/v1/models", nil)
+		if header != "" {
+			req.Header.Set("Authorization", header)
+		}
+		out := httptest.NewRecorder()
+		server.ServeHTTP(out, req)
+		if out.Code != status {
+			t.Errorf("Authorization %q: status=%d, want %d", header, out.Code, status)
+		}
+	}
+}
+
+func TestDefaultClientVersion(t *testing.T) {
+	backend := NewCursorBackend(config.Config{CursorAPIKey: "fixture-cursor-key", MaxConcurrent: 1})
+	if backend.client.ClientVersion != cursor.DefaultClientVersion || cursor.DefaultClientVersion != "cli-2025.08.01" {
+		t.Fatalf("client version=%q", backend.client.ClientVersion)
+	}
+}
+
 type stubBackend struct {
 	run        func(context.Context, func(cursor.TextChunk) error) error
 	modelCalls atomic.Int32
@@ -217,8 +254,15 @@ func TestRequestRejectionBeforeUpstream(t *testing.T) {
 		{"malformed", `{`, "fixture-proxy-key", 400},
 		{"trailing", `{} {}`, "fixture-proxy-key", 400},
 		{"model required", `{"messages":[{"role":"user","content":"hi"}]}`, "fixture-proxy-key", 400},
-		{"tools", `{"model":"test-model","tools":[]}`, "fixture-proxy-key", 400},
-		{"sampling", `{"model":"test-model","temperature":0}`, "fixture-proxy-key", 400},
+		{"tools", `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}`, "fixture-proxy-key", 400},
+		{"legacy functions", `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"functions":[{"name":"f"}]}`, "fixture-proxy-key", 400},
+		{"tool choice", `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"tool_choice":"required"}`, "fixture-proxy-key", 400},
+		{"tool history", `{"model":"test-model","messages":[{"role":"assistant","content":"x","tool_calls":[{"id":"1"}]},{"role":"user","content":"hi"}]}`, "fixture-proxy-key", 400},
+		{"stop", `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stop":["\n"]}`, "fixture-proxy-key", 400},
+		{"json mode", `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}`, "fixture-proxy-key", 400},
+		{"logprobs", `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"logprobs":true}`, "fixture-proxy-key", 400},
+		{"ignored field with wrong type", `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"temperature":"hot"}`, "fixture-proxy-key", 400},
+		{"unknown field", `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"fixture_unknown":1}`, "fixture-proxy-key", 400},
 		{"image", `{"model":"test-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image"}}]}]}`, "fixture-proxy-key", 400},
 		{"null content", `{"model":"test-model","messages":[{"role":"user","content":null}]}`, "fixture-proxy-key", 400},
 		{"multiple choices", `{"model":"test-model","n":2,"messages":[{"role":"user","content":"hi"}]}`, "fixture-proxy-key", 400},
@@ -243,6 +287,37 @@ func TestRequestRejectionBeforeUpstream(t *testing.T) {
 	}
 	if out := call(t, server, "POST", "/v1/chat/completions", "fixture-proxy-key", `{"model":"auto","messages":[{"role":"user","content":"hi"}]}`); out.Code != 400 {
 		t.Fatal("unknown model accepted")
+	}
+}
+
+func TestCommonOpenAIParametersAreAccepted(t *testing.T) {
+	var runs atomic.Int32
+	backend := &stubBackend{run: func(ctx context.Context, fn func(cursor.TextChunk) error) error {
+		runs.Add(1)
+		if err := fn(cursor.TextChunk{Text: "ok"}); err != nil {
+			return err
+		}
+		return fn(cursor.TextChunk{Done: true})
+	}}
+	server, _ := New(backend, "fixture-proxy-key", time.Second, 1)
+	params := `"temperature":0.2,"top_p":1,"max_tokens":16,"max_completion_tokens":16,"presence_penalty":0,"frequency_penalty":0,"seed":7,"user":"fixture-user",` +
+		`"n":1,"response_format":{"type":"text"},"tools":[],"tool_choice":"none","parallel_tool_calls":false,"functions":null,"function_call":"auto","logprobs":false,"top_logprobs":0`
+	messages := `"messages":[{"role":"user","name":"fixture","content":"hi"},{"role":"assistant","content":"hello","reasoning_content":"r","refusal":null,"tool_calls":null},{"role":"user","content":"again"}]`
+	for _, body := range []string{
+		`{"model":"test-model",` + messages + `,` + params + `,"stop":null}`,
+		`{"model":"test-model",` + messages + `,` + params + `,"stop":[],"stream":true,"stream_options":{"include_usage":true,"include_obfuscation":false}}`,
+	} {
+		out := call(t, server, "POST", "/v1/chat/completions", "fixture-proxy-key", body)
+		if out.Code != 200 || !strings.Contains(out.Body.String(), "ok") {
+			t.Fatalf("status=%d body=%s", out.Code, out.Body)
+		}
+	}
+	if runs.Load() != 2 {
+		t.Fatalf("runs=%d", runs.Load())
+	}
+	out := call(t, server, "POST", "/v1/chat/completions", "fixture-proxy-key", `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"fixture_unknown":1}`)
+	if !strings.Contains(out.Body.String(), `Unsupported request field \"fixture_unknown\"`) {
+		t.Fatalf("unknown field is not named: %s", out.Body)
 	}
 }
 
@@ -311,9 +386,12 @@ func TestCancellationAndConcurrencyLimit(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("upstream not started")
 	}
-	out := call(t, handler, "GET", "/v1/models", "fixture-proxy-key", "")
+	out := call(t, handler, "POST", "/v1/chat/completions", "fixture-proxy-key", `{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`)
 	if out.Code != 429 {
 		t.Fatalf("concurrency status=%d", out.Code)
+	}
+	if out := call(t, handler, "GET", "/v1/models", "fixture-proxy-key", ""); out.Code != 200 {
+		t.Fatalf("model listing waited for a chat slot: status=%d", out.Code)
 	}
 	cancel()
 	select {

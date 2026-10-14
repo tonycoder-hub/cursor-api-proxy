@@ -74,7 +74,7 @@ func TestRunSSENonOKResponseDoesNotExposeBody(t *testing.T) {
 	client.HTTP = server.Client()
 	client.RPCBase = server.URL
 	client.tok.accessToken = "test-access-token"
-	client.tok.fetchedAt = time.Now()
+	client.tok.expiresAt = time.Now().Add(time.Minute)
 
 	err := client.runSSE(context.Background(), IDs{RunID: "test-run"}, func(TextChunk) error {
 		t.Fatal("non-OK response emitted a text chunk")
@@ -166,7 +166,7 @@ func runSSEWithFrames(t *testing.T, frames [][]byte, onChunk func(TextChunk) err
 	client.HTTP = server.Client()
 	client.RPCBase = server.URL
 	client.tok.accessToken = "test-access-token"
-	client.tok.fetchedAt = time.Now()
+	client.tok.expiresAt = time.Now().Add(time.Minute)
 
 	return client.runSSE(context.Background(), IDs{RunID: "test-run"}, onChunk)
 }

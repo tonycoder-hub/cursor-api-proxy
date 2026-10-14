@@ -10,6 +10,7 @@ services:
       PROXY_API_KEY_FILE: /run/secrets/proxy_api_key
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-5m}
       MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-4}
+      CURSOR_CLIENT_VERSION: ${CURSOR_CLIENT_VERSION:-}
     secrets:
       - cursor_api_key
       - proxy_api_key
