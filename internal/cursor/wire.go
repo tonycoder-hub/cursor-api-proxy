@@ -73,10 +73,12 @@ func BuildBidiAppendBody(msg *cursorv1.AgentClientMessage, convID string, seq ui
 	if err != nil {
 		return nil, fmt.Errorf("marshal AgentClientMessage: %w", err)
 	}
-	hexed := hex.EncodeToString(raw)
-
-	var b []byte
-	b = lenField(b, 1, []byte(hexed))
+	// Hex-encode straight into a pre-sized body: the prompt is copied once.
+	hexLen := hex.EncodedLen(len(raw))
+	b := make([]byte, 0, hexLen+len(convID)+32)
+	b = tag(b, 1, 2)
+	b = putVarint(b, uint64(hexLen))
+	b = hex.AppendEncode(b, raw)
 	b = lenField(b, 2, uuidWrapper(convID))
 	if seq > 0 {
 		b = varintField(b, 3, seq)

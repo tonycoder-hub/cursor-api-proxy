@@ -7,13 +7,16 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
 	cursorv1 "github.com/tonycoder-hub/cursor-api-proxy/gen/cursorv1"
@@ -26,6 +29,9 @@ const (
 	procRunSSE     = "/agent.v1.AgentService/RunSSE"
 
 	clientType = "sdk"
+
+	// DefaultClientVersion is the x-cursor-client-version sent unless overridden.
+	DefaultClientVersion = "cli-2025.08.01"
 )
 
 // Client speaks Cursor's agent wire protocol directly.
@@ -58,7 +64,7 @@ func NewClient(apiKey string) *Client {
 		HTTP:          http.DefaultClient,
 		RPCBase:       defaultRPCBase,
 		APIKey:        apiKey,
-		ClientVersion: "cli-2025.08.01",
+		ClientVersion: DefaultClientVersion,
 		GhostMode:     true,
 	}
 }
@@ -84,34 +90,59 @@ func (c *Client) commonHeaders(h http.Header, bearer string) {
 }
 
 // bidiAppend performs one BidiService/BidiAppend unary call for a client message.
+// BidiAppend is a UNARY Connect call: raw protobuf body, no 5-byte frame prefix.
 func (c *Client) bidiAppend(ctx context.Context, msg *cursorv1.AgentClientMessage, convID string, seq uint64) error {
 	body, err := BuildBidiAppendBody(msg, convID, seq)
 	if err != nil {
 		return err
 	}
-	token, err := c.accessToken(ctx)
+	resp, _, err := c.post(ctx, procBidiAppend, "application/proto", body)
 	if err != nil {
 		return err
-	}
-	// BidiAppend is a UNARY Connect call: raw protobuf body, no 5-byte frame prefix.
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+procBidiAppend, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	c.commonHeaders(req.Header, token)
-	req.Header.Set("Content-Type", "application/proto")
-	req.Header.Set("connect-protocol-version", "1")
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return fmt.Errorf("BidiAppend: %w", err)
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("BidiAppend status %d", resp.StatusCode)
-	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	return nil
+}
+
+// post sends a Connect RPC with the cached access token and returns the 200
+// response and the token it used. A 401/403 means Cursor rejected the token and
+// did not apply the call, so the token is invalidated and the call is sent once
+// more with a freshly exchanged token.
+func (c *Client) post(ctx context.Context, proc, contentType string, body []byte) (*http.Response, string, error) {
+	op := path.Base(proc)
+	for attempt := 0; ; attempt++ {
+		token, err := c.accessToken(ctx)
+		if err != nil {
+			return nil, "", err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+proc, bytes.NewReader(body))
+		if err != nil {
+			return nil, "", err
+		}
+		c.commonHeaders(req.Header, token)
+		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("connect-protocol-version", "1")
+		if proc == procRunSSE {
+			req.Header.Set("x-cursor-streaming", "true")
+		}
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return nil, "", fmt.Errorf("%s: %w", op, err)
+		}
+		if resp.StatusCode == http.StatusOK {
+			return resp, token, nil
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		if authRejected(resp.StatusCode) {
+			c.invalidateToken(token)
+			if attempt == 0 {
+				continue
+			}
+		}
+		return nil, "", &StatusError{Op: op, Status: resp.StatusCode}
+	}
 }
 
 // TextChunk is a decoded piece of the model's output stream.
@@ -160,29 +191,13 @@ func (c *Client) Run(ctx context.Context, model, userText string, ids IDs, onChu
 // runSSE opens the RunSSE server stream and dispatches decoded chunks, replying to
 // the server's context request via additional BidiAppend calls.
 func (c *Client) runSSE(ctx context.Context, ids IDs, onChunk func(TextChunk) error) error {
-	token, err := c.accessToken(ctx)
+	// Only opening the stream is retried after an auth rejection; once frames
+	// were read, retrying could duplicate output.
+	resp, token, err := c.post(ctx, procRunSSE, "application/connect+proto", encodeFrame(BuildRunSSEBody(ids.RunID)))
 	if err != nil {
 		return err
-	}
-	body := encodeFrame(BuildRunSSEBody(ids.RunID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+procRunSSE, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	c.commonHeaders(req.Header, token)
-	req.Header.Set("Content-Type", "application/connect+proto")
-	req.Header.Set("connect-protocol-version", "1")
-	req.Header.Set("x-cursor-streaming", "true")
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return fmt.Errorf("RunSSE: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("RunSSE status %d: upstream request failed", resp.StatusCode)
-	}
 
 	// seq counter shared by the follow-up BidiAppend calls (context reply, acks).
 	var seq atomic.Uint64
@@ -196,7 +211,6 @@ func (c *Client) runSSE(ctx context.Context, ids IDs, onChunk func(TextChunk) er
 	}
 
 	r := bufio.NewReader(resp.Body)
-	contextSent := false
 	blobBytes := 0
 	blobs := map[string][]byte{} // remote blob store the server reads/writes mid-turn
 	for {
@@ -208,7 +222,14 @@ func (c *Client) runSSE(ctx context.Context, ids IDs, onChunk func(TextChunk) er
 			return err
 		}
 		if frame.EndStream() {
-			return parseRunSSETrailer(frame.Payload)
+			err := parseRunSSETrailer(frame.Payload)
+			// The stream was consumed, so it is not retried; the next request
+			// exchanges a fresh token instead of reusing the rejected one.
+			var trailerErr *TrailerError
+			if errors.As(err, &trailerErr) && trailerErr.Code == "unauthenticated" {
+				c.invalidateToken(token)
+			}
+			return err
 		}
 
 		var sm cursorv1.AgentServerMessage
@@ -216,21 +237,21 @@ func (c *Client) runSSE(ctx context.Context, ids IDs, onChunk func(TextChunk) er
 			return fmt.Errorf("decode RunSSE message failed")
 		}
 
-		// Answer the mid-turn context request exactly once.
-		if !contextSent {
-			if esm := sm.GetExecServerMessage(); esm != nil && esm.GetRequestContextArgs() != nil {
-				reply := c.contextReply()
-				reply.ExecClientMessage.Id = esm.GetId()
-				reply.ExecClientMessage.ExecId = esm.GetExecId()
-				if err := sendClient(reply); err != nil {
-					return fmt.Errorf("context reply: %w", err)
-				}
-				contextSent = true
-			}
+		// Every server request needs a reply: an unanswered one stalls the turn
+		// until the request timeout, so unsupported requests fail the stream.
+		if hasField(sm.ProtoReflect().GetUnknown(), interactionQueryField) {
+			return fmt.Errorf("Cursor sent an unsupported interaction query")
 		}
-
-		if esm := sm.GetExecServerMessage(); esm != nil && esm.GetRequestContextArgs() == nil {
-			return fmt.Errorf("Cursor requested unsupported tool execution")
+		if esm := sm.GetExecServerMessage(); esm != nil {
+			if esm.GetRequestContextArgs() == nil {
+				return fmt.Errorf("Cursor requested unsupported tool execution")
+			}
+			reply := c.contextReply()
+			reply.ExecClientMessage.Id = esm.GetId()
+			reply.ExecClientMessage.ExecId = esm.GetExecId()
+			if err := sendClient(reply); err != nil {
+				return fmt.Errorf("context reply: %w", err)
+			}
 		}
 
 		// Answer blob store requests so the server can finalize the turn.
@@ -255,11 +276,11 @@ func (c *Client) runSSE(ctx context.Context, ids IDs, onChunk func(TextChunk) er
 				} else {
 					reply.GetBlobResult = &cursorv1.GetBlobResult{Error: &cursorv1.Error{Message: "blob not found"}}
 				}
+			} else {
+				return fmt.Errorf("Cursor sent an unsupported blob store request")
 			}
-			if reply.SetBlobResult != nil || reply.GetBlobResult != nil {
-				if err := sendClient(&cursorv1.AgentClientMessage{KvClientMessage: reply}); err != nil {
-					return fmt.Errorf("kv reply: %w", err)
-				}
+			if err := sendClient(&cursorv1.AgentClientMessage{KvClientMessage: reply}); err != nil {
+				return fmt.Errorf("kv reply: %w", err)
 			}
 		}
 
@@ -267,6 +288,27 @@ func (c *Client) runSSE(ctx context.Context, ids IDs, onChunk func(TextChunk) er
 			return err
 		}
 	}
+}
+
+// interactionQueryField is AgentServerMessage.interaction_query in the upstream
+// schema: a server request (web search, questions, mode switches, ...) that
+// this proxy cannot answer. The other top-level fields the reduced schema drops
+// are notifications (checkpoints, exec aborts, timing) and are ignored.
+const interactionQueryField protowire.Number = 7
+
+// hasField reports whether the encoded protobuf fields in b include num.
+func hasField(b []byte, num protowire.Number) bool {
+	for len(b) > 0 {
+		n, _, length := protowire.ConsumeField(b)
+		if length < 0 {
+			return false
+		}
+		if n == num {
+			return true
+		}
+		b = b[length:]
+	}
+	return false
 }
 
 type runSSETrailer struct {
@@ -312,10 +354,7 @@ func parseRunSSETrailer(payload []byte) error {
 			break
 		}
 	}
-	if modelUnavailable {
-		return fmt.Errorf("Cursor RunSSE %s: model is not available for this account or region", code)
-	}
-	return fmt.Errorf("Cursor RunSSE %s: upstream request failed", code)
+	return &TrailerError{Code: code, ModelUnavailable: modelUnavailable}
 }
 
 func safeConnectCode(value string) string {

@@ -2,6 +2,7 @@ package cursor
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,16 +18,21 @@ type exchangeResponse struct {
 	RefreshToken string `json:"refreshToken"`
 }
 
-// tokenCache holds the exchanged access token and when it was fetched.
+// tokenCache holds the exchanged access token and when it stops being reused.
 type tokenCache struct {
 	mu          sync.Mutex
 	accessToken string
-	fetchedAt   time.Time
+	expiresAt   time.Time
 	refreshDone chan struct{}
 }
 
-// exchangeTTL is how long a cached access token is reused before re-exchanging.
-const exchangeTTL = 10 * time.Minute
+const (
+	// exchangeTTL is how long a cached access token is reused when the token
+	// does not carry its own expiry.
+	exchangeTTL = 10 * time.Minute
+	// tokenExpirySkew re-exchanges a token this long before its JWT exp.
+	tokenExpirySkew = time.Minute
+)
 
 // accessToken returns a valid RPC bearer token, exchanging the API key if needed.
 func (c *Client) accessToken(ctx context.Context) (string, error) {
@@ -35,7 +41,7 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 			return "", err
 		}
 		c.tok.mu.Lock()
-		if c.tok.accessToken != "" && time.Since(c.tok.fetchedAt) < exchangeTTL {
+		if c.tok.accessToken != "" && time.Now().Before(c.tok.expiresAt) {
 			token := c.tok.accessToken
 			c.tok.mu.Unlock()
 			return token, nil
@@ -55,13 +61,40 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 		token, err := c.exchangeToken(ctx)
 		c.tok.mu.Lock()
 		if err == nil {
-			c.tok.accessToken, c.tok.fetchedAt = token, time.Now()
+			c.tok.accessToken, c.tok.expiresAt = token, tokenExpiry(token, time.Now())
 		}
 		c.tok.refreshDone = nil
 		close(done)
 		c.tok.mu.Unlock()
 		return token, err
 	}
+}
+
+// invalidateToken drops token from the cache after Cursor rejected it. A token
+// that a concurrent caller already replaced is left alone.
+func (c *Client) invalidateToken(token string) {
+	c.tok.mu.Lock()
+	defer c.tok.mu.Unlock()
+	if c.tok.accessToken == token {
+		c.tok.accessToken, c.tok.expiresAt = "", time.Time{}
+	}
+}
+
+// tokenExpiry returns when a freshly exchanged token should stop being reused:
+// shortly before its JWT exp claim when present, otherwise after exchangeTTL.
+// The signature is not verified; exp is only a cache hint and a rejected token
+// is invalidated on 401/403 anyway.
+func tokenExpiry(token string, now time.Time) time.Time {
+	var claims struct {
+		Exp float64 `json:"exp"`
+	}
+	if parts := strings.Split(token, "."); len(parts) == 3 {
+		payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+		if err == nil && json.Unmarshal(payload, &claims) == nil && claims.Exp > 0 && claims.Exp < 1e11 {
+			return time.Unix(int64(claims.Exp), 0).Add(-tokenExpirySkew)
+		}
+	}
+	return now.Add(exchangeTTL)
 }
 
 func (c *Client) exchangeToken(ctx context.Context) (string, error) {
@@ -80,7 +113,7 @@ func (c *Client) exchangeToken(ctx context.Context) (string, error) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("exchange_user_api_key status %d", resp.StatusCode)
+		return "", &StatusError{Op: "exchange_user_api_key", Status: resp.StatusCode}
 	}
 	var er exchangeResponse
 	if err := json.Unmarshal(body, &er); err != nil {

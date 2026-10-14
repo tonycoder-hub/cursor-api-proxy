@@ -43,6 +43,9 @@ func NewCursorBackend(cfg config.Config) *CursorBackend {
 	transport.ResponseHeaderTimeout = 30 * time.Second
 	client := cursor.NewClient(cfg.CursorAPIKey)
 	client.RPCBase = cfg.RPCBaseURL
+	if cfg.ClientVersion != "" {
+		client.ClientVersion = cfg.ClientVersion
+	}
 	client.HTTP = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	return &CursorBackend{client: client, modelsURL: cfg.ModelsURL}
 }
@@ -97,7 +100,7 @@ func (b *CursorBackend) fetchModels(ctx context.Context) ([]Model, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("model discovery upstream status %d", resp.StatusCode)
+		return nil, &cursor.StatusError{Op: "model discovery", Status: resp.StatusCode}
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil || len(data) > 1<<20 {
